@@ -1,5 +1,17 @@
 cksq
 ----
 
-Lightweight file checksum monitor
+Lightweight file checksum monitor.
 
+The list of files to check are read from standard input.
+
+File paths (in a compressed form) and cryptographic hashes of their
+contents are stored in a BerkeleyDB file.
+
+Compression is achieved by storing every file path as <dir><name> where
+<dir> is a BER(like) value identifying the file's parent directory.  Hash
+values are also stored in BER(like) format.
+
+To obtain a plain text listing, use option -l:
+
+    $ cksq -l DB
