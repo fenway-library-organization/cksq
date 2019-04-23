@@ -12,117 +12,281 @@ use Getopt::Long
 my $algo = 'SHA-1';
 my $format;
 my $lend = "\n";
-my ($pfx, $pfxber, $init, $summarize, $count_files, $list, $clean, @remove, $prehashed, $verbose);
+my ($pfx, $pfxber, $prehashed, $verbose);
 
 my $rxw = qr/[\x80-\xff]*[\x00-\x7f]/;
 
 sub usage;
 sub fatal;
 
-GetOptions(
-    'i|initialize' => \$init,
-    's|summarize' => \$summarize,
-    'n|count-files' => \$count_files,
-    'l|list' => \$list,
-    'c|clean' => \$clean,
-    'r|remove=s' => \@remove,
-    # ---
-    'H|hash-algorithm=s' => \$algo,
-    'p|prefix=s' => \$pfx,
-    'P|no-prefix' => sub { $pfx = '' },
-    'f|format=s' => \$format,
-    'm|prehashed' => \$prehashed,
-    '0|null' => sub { $lend = "\x00" },
-    'v|verbose' => \$verbose,
-) or usage;
+@ARGV >= 1 or usage;
 
-@ARGV == 1 or usage;
-my ($dbfile) = @ARGV;
+my $cmd = shift @ARGV;
 
-my (%db, %cache, $db, $dbflags, $dbmode);
-if ($init) {
-    defined $pfx or fatal "You must specify a default prefix";
-    $dbflags = O_CREAT|O_RDWR;
-    $dbmode  = 0600;
-    $db = tie %db, 'DB_File', $dbfile, $dbflags, $dbmode, $DB_BTREE
-        or die;
-    %db = (
-        '!H' => $algo,
-        '!P' => $pfx,
-        '+D' => pack('w', 1),
-        '+P' => pack('w', 1),
-        #defined $format ? ('%f' => $format) : (),
-    );
-    print STDERR "Empty database $dbfile initialized\n";
-    exit 0;
-}
-elsif (! -f $dbfile) {
-    fatal "You must initialize the database first (cksq -i DBFILE)";
-}
-
-$dbflags = O_RDWR;
-$dbmode  = 0600;
-$db = tie %db, 'DB_File', $dbfile, $dbflags, $dbmode, $DB_BTREE
-    or die;
-fatal "Hash algorithm mismatch: $db{'!H'} stored, $algo specified"
-    if $db{'!H'} ne $algo;
-$pfx = $db{'!P'} if !defined $pfx;
-if (!defined $format) {
-    $format = length($pfx) ? '%* %h %p%f%z' : '%* %h %f%z';
-}
-my $out = compile_format($format);
-
+my (%db, %cache, $db, $dbfile, $dbflags, $dbmode, $printer);
 my ($sym, $file, $hasher, $hash, $hexhash, $dir, $name);
-$hasher = Digest->new($algo) if !$prehashed;
-$pfxber = symstr2ber('P' => $pfx) if defined $pfx;
 
-summarize() if $summarize;
-list()      if $list;
-count()     if $count_files;
-clean()     if $clean;
-remove(@remove) if @remove;
+&{ __PACKAGE__->can('cmd_'.$cmd) or usage };
 
-$/ = $lend;
-while (defined($file = <STDIN>)) {
-    undef $hexhash;
-    if ($prehashed) {
-        $file =~ s{^(\S+)\s+}{};
-        $hexhash = $1;
+# --- Command handlers
+
+sub cmd_init {
+    my ($force);
+    orient(
+        'y|force' => \$force,
+    );
+    defined $pfx or fatal "You must specify a default prefix";
+    usage if @ARGV != 1;
+    my ($f) = @ARGV;
+    fatal "DB already exists (use -y to force): $f"
+        if -e($f) && !$force;
+    initialize($f);
+    print STDERR "Empty database $dbfile initialized\n";
+}
+
+sub cmd_ls {
+    orient();
+    usage if @ARGV != 1;
+    opendb('<', @ARGV);
+    foreach my $fkey (grep { substr($_, 0, 1) eq 'F' } keys %db) {
+        $sym = '#';
+        $hash = $db{$fkey};
+        $hexhash = unpack('H*', $hash);
+        $fkey =~ /^F(${rxw})(${rxw})([^\x00]+)/;
+        ($pfxber, my $dirber, $name) = ($1, $2, $3);
+        $pfx = symber2str('P' => $pfxber);
+        $dir = symber2str('D' => $dirber);
+        $file = "$dir/$name";
+        $printer->();
     }
-    die "Absolute paths required" if $file !~ m{^/};
-    chomp $file;
-    next if !-f $file;
-    ($dir, $name) = ($file =~ m{^(.+)/(.+)$}s);
-    my $fkey = file2key($dir, $name);
-    if (!defined $hexhash) {
-        my $fh;
-        if (!open $fh, '<', $file) {
-            print STDERR "$!: $file\n";
+}
+
+sub cmd_summarize {
+    orient();
+    usage if @ARGV != 1;
+    opendb('<', @ARGV);
+    my %count = map { $_ => 0 } qw(D F H);
+    $count{substr($_, 0, 1)}++ for keys %db;
+    print STDERR <<"EOS";
+Hash algorithm:  $db{'!H'}
+Default prefix:  $db{'!P'}
+Number of dirs:  $count{'D'}
+Number of files: $count{'F'}
+EOS
+}
+
+sub cmd_count {
+    orient();
+    usage if @ARGV != 1;
+    opendb('<', @ARGV);
+    printf "%d\n", scalar grep { substr($_, 0, 1) eq 'F' } keys %db;
+}
+
+sub cmd_clean {
+    orient();
+    usage if @ARGV != 1;
+    opendb(@ARGV);
+    foreach my $fkey (grep { substr($_, 0, 1) eq 'F' } keys %db) {
+        $hash = $db{$fkey};
+        $hexhash   = unpack('H*', $hash);
+        $fkey =~ /^F(${rxw})(${rxw})([^\x00]+)/;
+        next if length($pfx) && $1 ne $pfxber;
+        ($pfxber, my $dirber, $name) = ($1, $2, $3);
+        $pfx = symber2str('P' => $pfxber);
+        $dir = symber2str('D' => $dirber);
+        $file = "$dir/$name";
+        if (-f $file) {
+            $sym = '.';
+            $printer->() if $verbose;
             next;
         }
-        $hexhash = $hasher->addfile($fh)->hexdigest;
-        close $fh;
+        delete $db{$fkey};
+        $sym = '-';
+        $printer->();
     }
-    $hash = pack('H*', $hexhash);
-    my $prevhash = $db{$fkey};
-    if (!defined $prevhash) {
-        # We've never seen this file before
-        $sym = '+';
-    }
-    elsif ($prevhash eq $hash) {
-        # This file is unchanged since last check
-        $sym = '.';
-        $out->() if $verbose;
-        next;
-    }
-    else {
-        $sym = '*';
-    }
-    my $dirber = symstr2ber('D' => $dir);
-    my $str = $pfxber . $dirber . $name . "\x00";
-    $db{$fkey} = $hash;
-    $out->();
 }
+
+sub cmd_remove {
+    orient();
+    usage if @ARGV != 1;
+    opendb(@ARGV);
+    foreach $file (@ARGV) {
+        $file =~ m{^(.+)/(.+)$}s or die;
+        ($dir, $name) = ($1, $2);
+        $pfxber = symstr2ber('P' => $pfx);
+        my $fkey = file2key($dir, $name);
+        if (!exists $db{$fkey}) {
+            print STDERR "Not in db: $file\n";
+            next;
+        }
+        $hash = $db{$fkey};
+        $hexhash = unpack('H*', $hash);
+        delete $db{$fkey};
+        $sym = '-';
+        $printer->();
+    }
+}
+
+sub cmd_add {
+    orient();
+    usage if @ARGV != 1;
+    opendb(@ARGV);
+    local $/ = $lend;
+    while (defined($file = <STDIN>)) {
+        undef $hexhash;
+        if ($prehashed) {
+            $file =~ s{^(\S+)\s+}{};
+            $hexhash = $1;
+        }
+        die "Absolute paths required" if $file !~ m{^/};
+        chomp $file;
+        next if !-f $file;
+        ($dir, $name) = ($file =~ m{^(.+)/(.+)$}s);
+        my $fkey = file2key($dir, $name);
+        if (!defined $hexhash) {
+            my $fh;
+            if (!open $fh, '<', $file) {
+                print STDERR "$!: $file\n";
+                next;
+            }
+            $hexhash = $hasher->addfile($fh)->hexdigest;
+            close $fh;
+        }
+        $hash = pack('H*', $hexhash);
+        my $prevhash = $db{$fkey};
+        if (!defined $prevhash) {
+            # We've never seen this file before
+            $sym = '+';
+        }
+        elsif ($prevhash eq $hash) {
+            # This file is unchanged since last check
+            $sym = '.';
+            $printer->() if $verbose;
+            next;
+        }
+        else {
+            $sym = '*';
+        }
+        #my $dirber = symstr2ber('D' => $dir);
+        #my $str = $pfxber . $dirber . $name . "\x00";
+        $db{$fkey} = $hash;
+        $printer->();
+    }
+}
+
+sub cmd_dirs {
+    orient();
+    usage if @ARGV != 1;
+    $format = '%d%N' if !defined $format;
+    opendb('<', @ARGV);
+    foreach my $dkey (grep { substr($_, 0, 1) eq 'D' } keys %db) {
+        $sym = '#';
+        $dkey =~ /^D(${rxw})/;
+        my $dirber = $1;
+        $dir = symber2str('D' => $dirber);
+        $printer->();
+    }
+}
+
+sub cmd_dump {
+    orient();
+    usage if @ARGV != 1;
+    $format = '%d%N' if !defined $format;
+    opendb('<', @ARGV);
+    my @keys = sort keys %db;
+    foreach my $key (@keys) {
+        my %key = parsekey($key);
+        my $type = $key{'_'};
+        next if $type eq '@';
+        if ($type eq 'F') {
+            $hash = $db{$key};
+            $hexhash = unpack('H*', $hash);
+            printf "F %s %s/%s\n", $hexhash, $key{'d'}, $key{'n'};
+        }
+        elsif ($type eq 'D') {
+            my $dkey = $db{'@'.$key{'d'}};
+            my $k = unpack 'w', $dkey;
+            printf "D \$%x %s\n", $k, $key{'d'};
+        }
+        elsif ($type eq '+') {
+            printf qq{+ %s \$%x\n}, $key{'+'}, unpack('w', $db{$key});
+        }
+        elsif ($type eq '!') {
+            printf qq{%s "%s"\n}, $key{'!'}, $db{$key};
+        }
+        elsif ($type eq '@') {
+            printf qq{\@ %s \$%x\n}, $key{'@'}, unpack('w', $db{$key});
+        }
+    }
+}
+
+sub cmd_load {
+    my ($force);
+    orient(
+        'y' => \$force,
+    );
+    usage if @ARGV != 1;
+    my ($f) = @ARGV;
+    fatal "DB already exists (use -y to force): $f"
+        if -s($f) && !$force;
+    my $ftmp = ".$f.cksq.$$";
+    initialize($ftmp);
+    my %nxt;
+    while (<STDIN>) {
+        if (m{^F (\S+) (.+)/(.+)$}) {
+            ($hexhash, $dir, $name) = ($1, $2, $3);
+            fatal "undefined directory: $dir" if !exists $db{'@'.$dir};
+            $hash = pack('H*', $hexhash);
+            my $fkey = file2key($dir, $name);
+            $db{$fkey} = $hash;
+        }
+        elsif (/^D \$(\S+) (.+)$/) {
+            my $dir = $2;
+            my $dkey = pack('w', hex $1);
+            $db{'D'.$dkey} = $dir;
+            $db{'@'.$dir} = $dkey;
+        }
+        elsif (/^\+ (D|P) \$(\S+)$/) {
+            $nxt{$1} = hex $2;
+        }
+        elsif (/^H "(.+)"$/) {
+            $algo = $db{'!H'} = $1;
+        }
+        elsif (/^P "(.*)"$/) {
+            $pfx = $db{'!P'} = $1;
+            $pfxber = symstr2ber('P' => $pfx);
+        }
+        elsif (/^\@ (\S+) \$(\S+)$/) {
+            1;
+        }
+    }
+    $db{'+D'} = pack('w', $nxt{'D'} || 1);
+    $db{'+P'} = pack('w', $nxt{'P'} || 1);
+    if (!rename $ftmp, $f) {
+        unlink $ftmp;
+        fatal "save file $f: $!";
+    }
+}
+
+sub cmd_mv {
+    orient();
+    usage if @ARGV != 3;
+    opendb('>', shift @ARGV);
+    my ($from, $to) = @ARGV;
+    my $rx = qr{\Q${from}\E(?:$|(?=/))};
+    my %patch;
+    foreach my $d (grep /^D/, keys %db) {
+        my $olddir = $db{$d};
+        (my $newdir = $olddir) =~ s{^$rx}{$to};
+        next if $newdir eq $olddir;
+        $db{$d} = $patch{$olddir} = $newdir;
+    }
+    while (my ($olddir, $newdir) = each %patch) {
+        $db{'@'.$newdir} = delete $db{'@'.$olddir};
+    }
+}
+
+# --- Other functions
 
 sub out {
     print $_, $lend for @_;
@@ -192,6 +356,50 @@ sub key2file {
     }
 }
 
+sub parsekey {
+    my ($key) = @_;
+    if ($key =~ s/^F//) {
+        if (defined $pfx) {
+            $key =~ /^($rxw)($rxw)([\x00-\xff]+)$/ or die;
+            return ('_' => 'F', 'P' => symber2str('P' => $1), 'd' => symber2str('D' => $2), 'n' => $3);
+        }
+        else {
+            $key =~ /^($rxw)([\x00-\xff]+)$/ or die;
+            return ('_' => 'F', 'd' => symber2str('D' => $1), 'n' => $2);
+        }
+    }
+    elsif ($key =~ s/^D//) {
+        return ('_' => 'D', 'd' => symber2str('D' => $key));
+    }
+    elsif ($key =~ /^([!@+])(.*)$/) {
+        return ('_' => $1, $1 => $2);
+    }
+    elsif ($key =~ s/^P//) {
+        return ('_' => 'P', 'P' => $key);
+    }
+    else {
+        die;
+    }
+}
+
+sub key2hex {
+    my ($key) = @_;
+    if ($key =~ s/^D//) {
+        return 'D$' . unpack('H*', $key);
+    }
+    elsif ($key =~ /^F/) {
+        $sym = '#';
+        $hash = $db{$key};
+        $hexhash = unpack('H*', $hash);
+        $key =~ /^F(${rxw})(${rxw})([^\x00]+)/;
+        ($pfxber, my $dirber, $name) = ($1, $2, $3);
+        $pfx = symber2str('P' => $pfxber);
+        $dir = symber2str('D' => $dirber);
+        return "$dir/$name";
+    }
+    # TODO
+}
+
 sub compile_format {
     my %k2r = (
         '*' => sub { print $sym      },
@@ -224,75 +432,75 @@ sub compile_format {
 }
 
 sub summarize {
-    my %count = map { $_ => 0 } qw(D F H);
-    $count{substr($_, 0, 1)}++ for keys %db;
-    print STDERR <<"EOS";
-Hash algorithm:  $db{'!H'}
-Default prefix:  $db{'!P'}
-Number of dirs:  $count{'D'}
-Number of files: $count{'F'}
-EOS
     exit 0;
 }
 
 sub list {
-    foreach my $fkey (grep { substr($_, 0, 1) eq 'F' } keys %db) {
-        $sym = '#';
-        $hash = $db{$fkey};
-        $hexhash   = unpack('H*', $hash);
-        $fkey =~ /^F(${rxw})(${rxw})([^\x00]+)/;
-        ($pfxber, my $dirber, $name) = ($1, $2, $3);
-        $pfx = symber2str('P' => $pfxber);
-        $dir = symber2str('D' => $dirber);
-        $file = "$dir/$name";
-        $out->();
-    }
     exit 0;
 }
 
 sub count {
-    printf "%d\n", scalar grep { substr($_, 0, 1) eq 'F' } keys %db;
     exit 0;
 }
 
 sub clean {
-    foreach my $fkey (grep { substr($_, 0, 1) eq 'F' } keys %db) {
-        $hash = $db{$fkey};
-        $hexhash   = unpack('H*', $hash);
-        $fkey =~ /^F(${rxw})(${rxw})([^\x00]+)/;
-        next if length($pfx) && $1 ne $pfxber;
-        ($pfxber, my $dirber, $name) = ($1, $2, $3);
-        $pfx = symber2str('P' => $pfxber);
-        $dir = symber2str('D' => $dirber);
-        $file = "$dir/$name";
-        if (-f $file) {
-            $sym = '.';
-            $out->() if $verbose;
-            next;
-        }
-        delete $db{$fkey};
-        $sym = '-';
-        $out->();
-    }
     exit 0;
 }
 
 sub remove {
-    foreach $file (@_) {
-        $file =~ m{^(.+)/(.+)$}s or die;
-        ($dir, $name) = ($1, $2);
-        $pfxber = symstr2ber('P' => $pfx);
-        my $fkey = file2key($dir, $name);
-        if (!exists $db{$fkey}) {
-            print STDERR "Not in db: $file\n";
-            next;
-        }
-        $hash = $db{$fkey};
-        $hexhash = unpack('H*', $hash);
-        delete $db{$fkey};
-        $sym = '-';
-        $out->();
-    }
     exit 0;
 }
+
+sub orient {
+    GetOptions(
+        'H|hash-algorithm=s' => \$algo,
+        'p|prefix=s' => \$pfx,
+        'P|no-prefix' => sub { $pfx = '' },
+        'f|format=s' => \$format,
+        'm|prehashed' => \$prehashed,
+        '0|null' => sub { $lend = "\x00" },
+        'v|verbose' => \$verbose,
+        @_,
+    ) or usage;
+}
+
+sub initialize {
+    ($dbfile) = @_;
+    $dbflags = O_CREAT|O_RDWR;
+    $dbmode  = 0600;
+    $db = tie %db, 'DB_File', $dbfile, $dbflags, $dbmode, $DB_BTREE
+        or die;
+    %db = (
+        '!H' => $algo,
+        '!P' => $pfx,
+        '+D' => pack('w', 1),
+        '+P' => pack('w', 1),
+        #defined $format ? ('%f' => $format) : (),
+    );
+}
+
+sub opendb {
+    my $mode = 0600;
+    if (@_ == 2 && $_[0] =~ /^[<>rw]$/) {
+        $mode = 0400 if shift =~ /[w>]/;
+    }
+    fatal "open multiple DB files??" if @_ > 1;
+    $dbfile = shift if @_;
+    fatal "You must initialize the database first (cksq init DBFILE)"
+        if !-f $dbfile;
+    $dbflags = O_RDWR;
+    $dbmode  = $mode;
+    $db = tie %db, 'DB_File', $dbfile, $dbflags, $dbmode, $DB_BTREE
+        or die;
+    fatal "Hash algorithm mismatch: $db{'!H'} stored, $algo specified"
+        if $db{'!H'} ne $algo;
+    $pfx = $db{'!P'} if !defined $pfx;
+    if (!defined $format) {
+        $format = length($pfx) ? '%* %h %p%f%z' : '%* %h %f%z';
+    }
+    $printer = compile_format($format);
+    $hasher = Digest->new($algo) if !$prehashed;
+    $pfxber = symstr2ber('P' => $pfx);
+}
+
 
